@@ -1,0 +1,342 @@
+---
+title: "Mapping the area of applicability (AOA) of prediction models"
+subtitle: "Questions to OpenGeoHub Summer school 2021 participants"
+author: "Hanna Meyer"
+date: "08/18/2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+```
+
+
+# Introduction
+
+This exercise should help you to get a better understanding of how the AOA estimation works, why it is important and what you might want to consider in order to develop models that are applicable for their respective purpose.
+
+# Prediction task
+The task is to perfom a supervised land cover classification for Münster in Germany.
+The challenge is: There are no reference data available...at least none for training, you'll get some later for validation ;-)
+Instead, for model training reference data from a few regions across Germany are provided (thanks to my Master Landscape ecology group at WWU!). This is a realistic scenario looking at the large variety of prediction maps e.g. in the context of ecology, where predictions are usually made far beyond training samples.
+
+
+```{r start, message=FALSE, warning=FALSE,echo=FALSE}
+#First, load a number of packages we'll need.
+library(raster)
+library(caret)
+library(mapview)
+library(sf)
+#library(devtools)
+#install_github("HannaMeyer/CAST")
+library(CAST)
+#additional required packages:
+library(tmap)
+library(latticeExtra)
+library(doParallel)
+library(parallel)
+library(Orcs)
+```
+
+## Data
+
+To start with, let's load and explore the data...
+
+### Raster data (predictor variables)
+
+As predictor variables for spatial mapping of the area of Münster, you have a Sentinel-2 image available with some derived artificial channels (NDVI, standard deviations of NDVI in a 5x5 Pixel environment, Latitude, Longitude)
+
+```{r load, message=FALSE,warning=FALSE}
+sen_ms <- stack("data/Sen_Muenster_sub.grd")
+```
+
+```{r rgbplots,echo=FALSE}
+
+rgbplot_ms <- spplot(sen_ms[[1]],  col.regions="transparent",sp.layout =rgb2spLayout(sen_ms[[3:1]], quantiles = c(0.02, 0.98), alpha = 1))
+```
+
+
+Let's plot the rasterStack to get an idea how the variables look like. 
+ 
+```{r visPredictors}
+plot(sen_ms)
+plotRGB(sen_ms,stretch="lin",r=3,g=2,b=1)
+```
+
+### Reference data
+
+As reference data we have digitized and labeled training polygons for some spatially distinct regions across Germany. Sentinel-2 data have been extracted for the training polygons and each pixel covered by a polygon is used as potential training data point.
+We start with splitting the data into validation (Münster) and training (other regions) data.
+
+```{r loadPoly}
+
+trainSites <- readRDS("data/data_combined_ll.RDS")
+trainDat <- trainSites[trainSites$Region!="Muenster",]
+validationDat <- trainSites[trainSites$Region=="Muenster",]
+head(trainSites)
+
+#see unique regions in train set:
+unique(trainDat$Region)
+
+```
+
+
+### Predictors and response
+
+In order to speed things up, for this example we will reduce the data. Therefore, from each training polygon only 15% of the pixels will be used for model training.
+
+
+```{r subset}
+set.seed(100)
+trainids <- createDataPartition(trainDat$ID,list=FALSE,p=0.15)
+trainDat <- trainDat[trainids,]
+trainDat <- trainDat[complete.cases(trainDat),]
+
+```
+
+For model training we need to define the predictor and response variables. To start with, as predictors we simply use basically all information from the raster stack without further consideration. As response variable we use the "Label" column of the data frame.
+
+```{r vars}
+predictors <- names(sen_ms)
+response <- "Label"
+```
+
+
+## Model training and validation
+We then train a random forest algorithm to learn relationships between the predictors and the land cover. 
+As a first naive approach we use the default modelling way with a default random cross-validation.
+
+
+```{r train_basic, warning=FALSE, message=FALSE}
+# train the model
+ctrl_default <- trainControl(method="cv", number = 3, savePredictions = TRUE)
+set.seed(100)
+model <- train(trainDat[,predictors],
+               trainDat[,response],
+               method="rf",
+               metric="Kappa",
+               trControl=ctrl_default,
+               importance=TRUE,
+               ntree=50)
+model
+
+```
+
+
+Looking at the performance it looks great, apparently a nearly perfect prediction model (keep in mind Kappa can take values up to 1 = perfect fit).
+
+## Model prediction
+To do the classification we can then use the trained model and apply it to each pixel of the raster stack using the predict function. 
+
+```{r predict, message=FALSE, warning=FALSE}
+prediction <- predict(sen_ms,model)
+```
+
+```{r vispredict, message=FALSE, warning=FALSE, echo=FALSE}
+prediction <- predict(sen_ms,model)
+cols <- rev(c("blue","red","darkorange","lightgreen","brown","green", "grey","green2","forestgreen","darkgreen"))
+
+tm_shape(deratify(prediction)) +
+  tm_raster(palette = cols,title = "LUC")+
+  tm_scale_bar(bg.color="white",bg.alpha=0.75)+
+  tm_layout(legend.bg.color = "white",
+            legend.bg.alpha = 0.75)
+```
+
+However, quite obviously, the result doesn't look very good compared to the RGB. Very obvious is that the city of Münster is mainly predicted as "open Soil". Why is this possible keeping in mind that the cross-validation results indicated a nearly perfect model?
+
+### Can the model predict beyond training regions?
+The reason is that we apply the model to make predictions for a new region. But the random CV doesn't help to estimate the performance for Münster (or other regions). This is because the data are heavily clustered in space (i.e. several data points from the same training polygon, see explanation in the recordings of the previous summer schools), hence random CV is only helpful to answer the question how well the model can make predictions for the same cluster as used during training. 
+
+To get a more suitable performance estimate, we re-train the model with spatial CV. Since we want to apply the model to a new region within Germany, an obvious way of splitting the data is to split by region: In each iteration of cross-validation, one region is left out and used for validation instead of training. 
+
+
+```{r train_sp, warning=FALSE, message=FALSE, results='hide'}
+# train the model
+indices <- CreateSpacetimeFolds(trainDat,spacevar = "Region",k=length(unique(trainDat$Region)))
+ctrl_sp <- trainControl(method="cv", index = indices$index, savePredictions = TRUE)
+
+set.seed(100)
+model_sp <- train(trainDat[,predictors],
+               trainDat[,response],
+               method="rf",
+               metric="Kappa",
+               trControl=ctrl_sp,
+               importance=TRUE,
+               ntree=50)
+```
+
+Let's compare the performance estimates.
+```{r compare_performance, warning=FALSE, message=FALSE, results='hide'}
+boxplot(model$resample$Kappa, model_sp$resample$Kappa,
+        names=c("random CV", "spatial CV"),ylab="Kappa Index")
+
+```
+
+Based on the spatial CV, we expect the performance for Münster to be considerably lower compared to the random CV (Kappa around 0.4 to 0.6).
+
+### Validation with external validation data of Münster
+
+We see large differences between random and spatial CV. Recently it has been argued against spatial CV for estimating map accuracy (https://www.sciencedirect.com/science/article/abs/pii/S0304380021002489?via%3Dihub). However, as outlined above, a spatial CV is the only meaningful way to estimate the performance for clustered data if no probability sample is available. Let's test if the spatial CV estimates are reasonable: We now use the validation data and validate the predictions with these external data.
+
+```{r definition, echo = FALSE}
+
+validation <- function(x,y=validationDat){
+confusionMatrix(factor(x,levels=unique(unique(as.character(x),unique(as.character(y$Label))))),factor(y$Label,unique(unique(as.character(x),unique(as.character(y$Label))))))$overall[1:2]
+}
+
+```
+
+```{r validation, warning=FALSE, message=FALSE}
+
+pred_muenster_valid <- predict(model_sp,validationDat)
+head(pred_muenster_valid)
+head(validationDat$Label)
+validation(pred_muenster_valid)
+
+```
+
+Seems like the external validation is well comparable to the spatial CV estimate (and as expected not at all comparable to the random CV estimate).
+
+
+
+## Area of Applicability
+Technically it was no problem to make predictions for Münster. But let's assess if we really should have done this. A trained model should only be applied to locations that feature predictor properties that are comparable to those of the training data. Read https://besjournals.onlinelibrary.wiley.com/doi/10.1111/2041-210X.13650 to get familiar with the idea. If dissimilarity to the training data is larger than the dissimilarity within the training data, Meyer and Pebesma (2021) suggest that the model should not be applied to this location.
+
+The calculation of the AOA is quite time consuming. To make a bit faster we use a parallelization.
+
+```{r aoa}
+cl <- makeCluster(4)
+registerDoParallel(cl)
+AOA <- aoa(sen_ms,model,cl=cl)
+plot(AOA)
+
+```
+
+We see that the AOA has only values of 0 which means that no pixel falls inside the AOA. Now we can visualize the prediction for the AOA only.
+
+```{r aoavis, echo=FALSE}
+cols_aoa <-  c("black","transparent")
+if (sum(values(AOA$AOA))==0){
+  cols_aoa <-  c("black")
+}
+predplot <- spplot(deratify(prediction),col.regions=cols, main = list(label="Prediction (left), prediction only for the AOA (right) and RGB composite (bottom)",cex=0.8))
+
+predplotaoa <- spplot(deratify(prediction),col.regions=cols)+
+spplot(AOA$AOA,col.regions=cols_aoa)
+latticeCombineGrid(list(predplot,predplotaoa,rgbplot_ms),layout=c(2,2))
+
+```
+
+We see that no predictions are shown because the model is not considered applicable to any part of the area of Münster.
+
+### Percentage of AOA
+As a starting point for further improvement, let's calculate the percentage of the AOA for Münster. 
+
+```{r aoa_performance,echo=FALSE}
+print(paste0("Percentage of Münster that is within the AOA: ",
+             round(sum(values(AOA$AOA)==1)/ncell(AOA),2)*100
+," %"))
+
+```
+
+# Problem to be solved
+Obviously, the model was not applicable to any part of Münster. The prediction patterns confirm that the model cannot make any reliable predictions here. Now it's up to you to solve this.
+
+# Sample solution
+To find explanations for the patters, let's look at the variable importance within the model.
+
+```{r varimp}
+plot(varImp(model))
+```
+
+It's interesting that latitude and longitude are so important here. However, we would not expect that these are meaningful predictors in order to predict beyond training regions (see discussions at previous summer schools). If this is the case the solution is quite easy: Removing these variables should improve the spatial model performance and should also increase the AOA because it will lead to a model that is less overfitted to the training data.
+So let's do a spatial variable selection that is selecting a combination of predictor variables that lead to the best leave-region-out model performance. In this way we expect that that we can train a model that is as generalized as possible to be applied to a new region.
+
+
+```{r train_ffs, warning=FALSE, message=FALSE, results='hide'}
+
+#ffs
+set.seed(100)
+model_ffs <- ffs(trainDat[,predictors],
+               trainDat[,response],
+               method="rf",
+               metric="Kappa",
+               trControl=ctrl_sp,
+               importance=TRUE,
+               ntree=50)
+
+plot_ffs(model_ffs)
+plot_ffs(model_ffs,plotType = "selected")
+```
+
+Lets also have a look at the estimated spatial cross-validation performance in comparison to the original model
+
+
+```{r cv_ffs, warning=FALSE, message=FALSE, results='hide'}
+boxplot(model_sp$resample$Kappa,model_ffs$resample$Kappa,
+        names=c("original model", "after variable selection"),ylab="Kappa Index")
+```
+
+Next, we make predictions for Münster.
+```{r vispredict_ffs, message=FALSE, warning=FALSE, echo=FALSE}
+prediction_ffs <- predict(sen_ms,model_ffs)
+cols <- rev(c("blue","red","darkorange","lightgreen","brown","green", "grey","green2","forestgreen","darkgreen"))
+
+tm_shape(deratify(prediction_ffs)) +
+  tm_raster(palette = cols,title = "LUC")+
+  tm_scale_bar(bg.color="white",bg.alpha=0.75)+
+  tm_layout(legend.bg.color = "white",
+            legend.bg.alpha = 0.75)
+```
+
+
+Let's then estimate the AOA of the new model.
+
+
+```{r aoa_ffs, warning=FALSE, message=FALSE, results='hide'}
+cl <- makeCluster(4)
+registerDoParallel(cl)
+AOA_ffs <- aoa(sen_ms,model_ffs,cl=cl)
+plot(AOA_ffs)
+```
+
+Let's visualize the results:
+  
+```{r vis_ffs, warning=FALSE, message=FALSE, echo=FALSE}
+
+predplot <- spplot(deratify(prediction_ffs),col.regions=cols, main = list(label="Prediction (left), prediction only for the AOA (right) and RGB composite (bottom)",cex=0.8))
+
+cols_aoa <-  c("black","transparent")
+if (sum(values(AOA_ffs$AOA))==0){
+  cols_aoa <-  c("black")
+}
+
+predplotaoa <- spplot(deratify(prediction_ffs),col.regions=cols)+
+  spplot(AOA_ffs$AOA,col.regions=cols_aoa)
+latticeCombineGrid(list(predplot,predplotaoa,rgbplot_ms),layout=c(2,2))
+
+```
+
+... and validate the predictions and calculate percentage within the AOA.
+
+```{r aoa_performance2,echo=FALSE}
+pred_muenster_valid <- predict(model_ffs,validationDat)
+validation(pred_muenster_valid)
+print(paste0("Percentage of Münster that is within the AOA: ",round(sum(values(AOA_ffs$AOA)==1)/ncell(AOA),2)*100," %"))
+
+```
+
+Using the spatial variable selection we could develop a more generalizable model which is reflected by: 
+
+1. more meaningful prediction patterns 
+
+2. higher spatial CV performance 
+
+3. a larger AOA.
